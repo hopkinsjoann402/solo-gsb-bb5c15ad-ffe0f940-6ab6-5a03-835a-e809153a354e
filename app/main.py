@@ -42,6 +42,13 @@ predicted correct rates, and a standardised deviation
 samples or when its denominator is zero), flagging systematic miscalibration
 at ``|z| >= 1.96``.
 
+Every item keeps an append-only revision history: a formal import appends a
+version only for a real new id or an actual content change, and the
+availability PATCH appends one only when the enabled state really flips;
+same-value retries, dry runs and failed batches create no version.  A legacy
+bank gets one version-1 baseline per item at first startup (idempotently).
+
+
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
 cannot be lost to read/write races.
@@ -59,11 +66,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from . import irt
+from . import revisions
 from .analysis import analyze_item
 from .calibration import calibrate_item
 from .database import get_db, init_db
@@ -81,6 +89,9 @@ from .models import (
     ItemImportResponse,
     ItemImportRowOut,
     ItemOut,
+    ItemRevisionListOut,
+    ItemRevisionOut,
+    ItemRevisionSummaryOut,
     NextItemOut,
     ProgressOut,
     ResponseCreate,
@@ -103,9 +114,11 @@ app = FastAPI(
         "活动会话支持暂停（冻结剩余时限）与恢复（按剩余秒数重算 UTC 截止时间）；"
         "题目可撤回/启用，撤回题不再参与新取题；"
         "已结束会话支持答卷雷同复核（同错选项加权相似度）；"
-        "单题预测概率校准对比作答前保存的 p_correct 与实际得分。"
+        "单题预测概率校准对比作答前保存的 p_correct 与实际得分；"
+        "题库修订历史在正式导入新增/内容变化、启用状态实际变化时"
+        "于同一写事务内追加完整快照版本（旧库首启建立基线，幂等不重复）。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -498,6 +511,12 @@ def set_item_availability(
     still served from the idempotency store.  ``{"is_active": true}``
     re-enables the item.  The toggle itself is idempotent: setting the
     same state again simply returns the current row.
+
+    Revision history: only an actual state flip (enabled -> withdrawn or
+    withdrawn -> enabled) appends a new immutable version inside this same
+    transaction (``change_source = withdraw`` / ``re_enable``), snapshotting
+    the post-change item.  A same-value retry writes nothing and creates no
+    version.
     """
     with transaction(conn):
         row = conn.execute(
@@ -505,13 +524,26 @@ def set_item_availability(
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="item not found")
-        conn.execute(
-            "UPDATE items SET is_active = ? WHERE id = ?",
-            (1 if body.is_active else 0, item_id),
-        )
-        row = conn.execute(
-            "SELECT * FROM items WHERE id = ?", (item_id,)
-        ).fetchone()
+        new_active = 1 if body.is_active else 0
+        if row["is_active"] != new_active:
+            conn.execute(
+                "UPDATE items SET is_active = ? WHERE id = ?",
+                (new_active, item_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM items WHERE id = ?", (item_id,)
+            ).fetchone()
+            # Actual availability change: append the post-change snapshot in
+            # the same transaction; a same-value retry never reaches here.
+            revisions.record_revision(
+                conn,
+                item_id=item_id,
+                change_source=(
+                    revisions.SOURCE_WITHDRAW
+                    if new_active == 0
+                    else revisions.SOURCE_RE_ENABLE
+                ),
+            )
     return serialize_bank_item(row)
 
 
@@ -586,6 +618,105 @@ def item_calibration(
 
 
 # -------------------------------------------------------------------------
+# Item revision history (read-only)
+# -------------------------------------------------------------------------
+
+def serialize_revision_summary(row: sqlite3.Row) -> ItemRevisionSummaryOut:
+    return ItemRevisionSummaryOut(
+        item_id=row["item_id"],
+        version=row["version"],
+        change_source=row["change_source"],
+        is_active=bool(row["is_active"]),
+        created_at=row["created_at"],
+    )
+
+
+def serialize_revision(row: sqlite3.Row) -> ItemRevisionOut:
+    return ItemRevisionOut(
+        item_id=row["item_id"],
+        version=row["version"],
+        change_source=row["change_source"],
+        stem=row["stem"],
+        options=parse_options(row["options"]),
+        answer=row["answer"],
+        difficulty=row["difficulty"],
+        discrimination=row["discrimination"],
+        content_tag=row["content_tag"],
+        is_active=bool(row["is_active"]),
+        created_at=row["created_at"],
+    )
+
+
+@app.get(
+    "/api/items/{item_id}/revisions",
+    response_model=ItemRevisionListOut,
+    tags=["items"],
+    summary="查询题目的修订历史版本列表（元数据，按版本号升序；未知题目 404）",
+)
+def list_item_revisions(
+    item_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> ItemRevisionListOut:
+    """List every recorded version of one item, oldest first.
+
+    The list carries version metadata only (version number, change source,
+    the post-change enabled state and the UTC creation time); fetch a full
+    snapshot from ``GET /api/items/{id}/revisions/{version}``.  Versions are
+    continuous per item starting at 1 (the startup ``baseline``) and are
+    append-only, so later imports can never rewrite an older entry.  An
+    unknown item returns 404.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    rows = conn.execute(
+        "SELECT item_id, version, change_source, is_active, created_at "
+        "FROM item_revisions WHERE item_id = ? ORDER BY version ASC",
+        (item_id,),
+    ).fetchall()
+    return ItemRevisionListOut(
+        item_id=item_id,
+        count=len(rows),
+        results=[serialize_revision_summary(r) for r in rows],
+    )
+
+
+@app.get(
+    "/api/items/{item_id}/revisions/{version}",
+    response_model=ItemRevisionOut,
+    tags=["items"],
+    summary="查询指定版本的完整快照（题干/选项/答案/难度/区分度/标签/启用状态；404）",
+)
+def get_item_revision(
+    item_id: str,
+    version: int = Path(..., ge=1, description="版本号（>= 1）"),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ItemRevisionOut:
+    """Return one immutable version snapshot.
+
+    The snapshot contains the complete post-change content: stem, options,
+    answer, difficulty, discrimination, content tag and the enabled state.
+    It deliberately excludes ``exposure_count``, which changes whenever the
+    item is served and is not a bank revision.  Snapshot rows are never
+    updated or deleted, so this response is stable for the item's lifetime.
+    An unknown item or an unknown version number returns 404.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    row = conn.execute(
+        "SELECT * FROM item_revisions WHERE item_id = ? AND version = ?",
+        (item_id, version),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="revision not found")
+    return serialize_revision(row)
+
+
+# -------------------------------------------------------------------------
 # Item bank bulk import / pre-check
 # -------------------------------------------------------------------------
 
@@ -613,18 +744,20 @@ ON CONFLICT(id) DO UPDATE SET
 """
 
 
-def _existing_item_ids(
+def _existing_item_rows(
     conn: sqlite3.Connection, item_ids: list[str]
-) -> set[str]:
-    found: set[str] = set()
+) -> dict[str, sqlite3.Row]:
+    """Full pre-upsert ``items`` rows keyed by id (chunks stay under SQLite's
+    999-parameter bound).  Needed because revision history compares the
+    incoming payload against the complete pre-change content."""
+    found: dict[str, sqlite3.Row] = {}
     for start in range(0, len(item_ids), _EXISTING_ID_CHUNK):
         chunk = item_ids[start : start + _EXISTING_ID_CHUNK]
         placeholders = ",".join("?" for _ in chunk)
         found.update(
-            r["id"]
-            for r in conn.execute(
-                f"SELECT id FROM items WHERE id IN ({placeholders})", chunk
-            ).fetchall()
+            {r["id"]: r for r in conn.execute(
+                f"SELECT * FROM items WHERE id IN ({placeholders})", chunk
+            ).fetchall()}
         )
     return found
 
@@ -740,21 +873,23 @@ def import_items(
         )
 
     if body.dry_run:
-        # Read-only snapshot; no write lock is taken and nothing is written.
-        existing_ids = _existing_item_ids(conn, [i.id for i in items])
+        # Read-only snapshot; no write lock is taken and nothing is written,
+        # and in particular no revision version is produced by a pre-check.
+        existing_rows = _existing_item_rows(conn, [i.id for i in items])
         payload, _ = _import_payload(
             dry_run=True,
             total=total,
             errors=[],
             items=items,
-            existing_ids=existing_ids,
+            existing_ids=set(existing_rows),
         )
         return payload
 
+    now = utc_now()
     with transaction(conn):
         # Re-classify inside the write lock: the serialised transaction makes
         # the exists-check plus upsert atomic against concurrent imports.
-        existing_ids = _existing_item_ids(conn, [i.id for i in items])
+        existing_rows = _existing_item_rows(conn, [i.id for i in items])
         conn.executemany(
             _UPSERT_ITEM_SQL,
             [
@@ -770,12 +905,29 @@ def import_items(
                 for item in items
             ],
         )
+        # Revision history, in the SAME transaction (so a failure rolls the
+        # versions back together with the upsert): a brand-new id gets an
+        # import_create snapshot; an existing id gets an import_update version
+        # only when its content actually differs.  Re-importing identical
+        # content produces no version; is_active/exposure_count are preserved
+        # by the upsert and therefore never trigger one here.
+        for item in sorted(items, key=lambda n: n.row):
+            old_row = existing_rows.get(item.id)
+            if old_row is None:
+                source = revisions.SOURCE_IMPORT_CREATE
+            elif revisions.import_row_changed(old_row, item):
+                source = revisions.SOURCE_IMPORT_UPDATE
+            else:
+                continue
+            revisions.record_revision(
+                conn, item_id=item.id, change_source=source, now=now
+            )
     payload, _ = _import_payload(
         dry_run=False,
         total=total,
         errors=[],
         items=items,
-        existing_ids=existing_ids,
+        existing_ids=set(existing_rows),
     )
     return payload
 

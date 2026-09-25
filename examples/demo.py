@@ -19,6 +19,11 @@ The last section demonstrates item withdrawal
 selections, a withdrawn pending item is cleared and re-selected by /next
 without rolling back its exposure, new answers for it are rejected with
 409 while a stored ``response_id`` replay still returns the first result.
+It also demonstrates the item revision history: a formal import appends a
+version only for a new id or an actual content change, availability flips
+append withdraw/re_enable versions, while dry runs, failed batches and
+same-value retries create no version; old libraries receive an idempotent
+version-1 baseline at first startup.
 """
 
 from __future__ import annotations
@@ -185,6 +190,7 @@ def main() -> None:
     demo_precision_stop()
     demo_pause_resume()
     demo_withdrawal()
+    demo_revisions()
 
 
 def demo_pause_resume() -> None:
@@ -578,6 +584,143 @@ def demo_withdrawal() -> None:
     show("题库列表返回启用状态（演示题已重新撤回）", demo_rows)
     assert all(v is False for v in demo_rows.values())
     print("  -> 题库列表/详情均返回 is_active；演示题已撤回，不影响后续演示 ✔")
+
+
+def call_status(method: str, path: str, payload: dict | None = None):
+    """Like call() but returns (status_code, body) without raising."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        BASE_URL + path, data=data,
+        headers={"Content-Type": "application/json"}, method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
+def demo_revisions() -> None:
+    """Show the append-only item revision history end to end."""
+    print("\n--- 题库修订历史 ---")
+    iid = "DEMO-RV-1"
+
+    def rev_item(stem: str, answer: str = "A") -> dict:
+        return {
+            "id": iid, "difficulty": 0.42, "discrimination": 1.2,
+            "content_tag": "修订演示", "stem": stem,
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": answer,
+        }
+
+    # 0) 每个现存题在首启时已有一个 baseline 版本（30 道演示题均为 v1），
+    #    且重复启动不会重复生成。
+    seed_revs = call("GET", "/api/items/ITEM-001/revisions")
+    assert seed_revs["count"] >= 1
+    assert seed_revs["results"][0]["version"] == 1
+    assert seed_revs["results"][0]["change_source"] == "baseline"
+    print(f"  -> 演示题 ITEM-001 有 {seed_revs['count']} 个版本，"
+          "首个为首启 baseline（重复启动不重复生成）✔")
+
+    # 1) 预检（dry_run）不产生任何版本（此时该题可能尚未存在，GET 为 404）。
+    def rev_count() -> int:
+        """Version count of the demo item; 0 while it does not exist yet."""
+        status_code, body = call_status("GET", f"/api/items/{iid}/revisions")
+        return body["count"] if status_code == 200 else 0
+
+    n0 = rev_count()
+    pre = call("POST", "/api/items/import",
+               {"dry_run": True, "items": [rev_item("预检题，不应写库")]})
+    assert pre["valid"] is True
+    assert rev_count() == n0, "预检不应产生版本"
+    print("  -> dry_run 预检不写库、不产生版本 ✔")
+
+    # 2) 正式导入：新题 -> import_create（重复运行时当前内容已被上轮改成
+    #    其他版本，本次同样算作一次内容变化 -> import_update）；总之版本 +1。
+    call("POST", "/api/items/import",
+         {"items": [rev_item("修订演示题 v1 内容")]})
+    revs = call("GET", f"/api/items/{iid}/revisions")["results"]
+    assert len(revs) == n0 + 1
+    n_after_create = len(revs)
+    if n0 == 0:
+        assert revs[0]["change_source"] == "import_create"
+        print("  -> 首次运行：正式导入新题产生 import_create v1 ✔")
+    else:
+        print("  -> 重复运行脚本：历史版本保留，本次导入继续追加新版本 ✔")
+
+    call("POST", "/api/items/import",
+         {"items": [rev_item("修订演示题 v1 内容")]})
+    revs = call("GET", f"/api/items/{iid}/revisions")["results"]
+    assert len(revs) == n_after_create, "同值重试不应产生版本"
+    print("  -> 同值内容重复导入不产生新版本 ✔")
+
+    # 3) 整批校验失败（答案不在选项键中）-> 422，整批不变，不产生版本。
+    status, bad = call_status(
+        "POST", "/api/items/import",
+        {"items": [rev_item("坏批次不应写库", answer="Z")]},
+    )
+    assert status == 422 and bad["valid"] is False
+    revs = call("GET", f"/api/items/{iid}/revisions")["results"]
+    assert len(revs) == n_after_create, "失败批次不应产生版本"
+    print("  -> 整批校验失败返回 422，整批不变、不产生版本 ✔")
+
+    # 4) 内容变化（题干/答案）的正式导入 -> import_update，版本连续。
+    call("POST", "/api/items/import",
+         {"items": [rev_item("修订演示题 v2 内容（改题干）")]})
+    call("POST", "/api/items/import",
+         {"items": [rev_item("修订演示题 v3 内容（改答案）", answer="B")]})
+    revs = call("GET", f"/api/items/{iid}/revisions")["results"]
+    assert len(revs) == n_after_create + 2
+    assert [r["version"] for r in revs] == list(range(1, len(revs) + 1)), \
+        "版本号必须连续"
+    assert [r["change_source"] for r in revs[-2:]] == ["import_update"] * 2
+    print(f"  -> 两次内容变化各产生一个 import_update 版本（现共 {len(revs)} 版）✔")
+
+    # 5) 启用状态实际变化 -> withdraw / re_enable；同值重试无新版本。
+    call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    n_before_same = len(call("GET", f"/api/items/{iid}/revisions")["results"])
+    again = call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    assert again["is_active"] is False
+    assert len(call("GET", f"/api/items/{iid}/revisions")["results"]) \
+        == n_before_same, "同值撤回重试不应产生版本"
+    call("PATCH", f"/api/items/{iid}/availability", {"is_active": True})
+    revs = call("GET", f"/api/items/{iid}/revisions")["results"]
+    assert [r["change_source"] for r in revs[-2:]] == ["withdraw", "re_enable"]
+    assert revs[-2]["is_active"] is False and revs[-1]["is_active"] is True
+    print("  -> 撤回/启用实际翻转产生 withdraw/re_enable 版本；"
+          "同值重试不产生 ✔")
+
+    # 6) 指定版本快照：完整字段、不含曝光次数；历史版本不被后续导入改写。
+    #    题库行照常返回 exposure_count（该题可能在以往演示中已被作答），
+    #    但任何版本快照都不携带这个随作答变化的字段。
+    detail = call("GET", f"/api/items/{iid}")
+    assert detail["exposure_count"] >= 0
+    # 找到「v1 内容」那次导入对应的历史版本（首次运行即 v1；重复运行时
+    # v1 是上一轮更早的版本，但本次导入的内容一定在历史中且此后不变）。
+    target_meta = next(
+        r for r in revs
+        if call("GET", f"/api/items/{iid}/revisions/{r['version']}")["stem"]
+        == "修订演示题 v1 内容"
+    )
+    v1 = call("GET", f"/api/items/{iid}/revisions/{target_meta['version']}")
+    assert v1["stem"] == "修订演示题 v1 内容"
+    for field in ("stem", "options", "answer", "difficulty",
+                  "discrimination", "content_tag", "is_active"):
+        assert field in v1, f"快照必须包含 {field}"
+    assert "exposure_count" not in v1, "快照不得包含曝光次数"
+    assert v1["options"] == [{"key": "A", "text": "2"},
+                             {"key": "B", "text": "3"}]
+    show(f"GET .../revisions/{target_meta['version']}（历史版本完整快照，不含曝光次数）", v1)
+    print("  -> 快照含题干/选项/答案/难度/区分度/标签/启用状态，"
+          "不含曝光次数；后续导入未改写历史版本 ✔")
+
+    # 7) 未知题目 / 未知版本 -> 404。
+    status_code, body = call_status("GET", "/api/items/NO-SUCH-ITEM/revisions")
+    assert status_code == 404, body
+    status_code, body = call_status(
+        "GET", f"/api/items/{iid}/revisions/9999")
+    assert status_code == 404, body
+    print("  -> 未知题目与未知版本均返回 404 ✔")
 
 
 if __name__ == "__main__":

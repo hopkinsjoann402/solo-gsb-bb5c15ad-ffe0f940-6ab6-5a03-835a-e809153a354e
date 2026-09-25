@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
+from .revisions import ensure_baseline_revisions
 from .seed import seed_items
 
 # Default keeps local runs working out of the box; the Docker image sets this
@@ -84,6 +85,32 @@ CREATE TABLE IF NOT EXISTS responses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_responses_session ON responses(session_id);
+
+-- Append-only item revision history.  One continuous version chain per item:
+-- version 1 is the startup baseline (also for freshly seeded demo items);
+-- formal imports append import_create/import_update versions only on real
+-- new content or actual content changes, and the availability PATCH appends
+-- withdraw/re_enable versions only when the enabled state actually flips.
+-- The snapshot copies the post-change content columns verbatim but never
+-- exposure_count (which mutates with every served answer).  No code path
+-- ever UPDATEs or DELETEs rows here, so later imports cannot rewrite history.
+CREATE TABLE IF NOT EXISTS item_revisions (
+    item_id        TEXT NOT NULL REFERENCES items(id),
+    version        INTEGER NOT NULL CHECK (version >= 1),
+    change_source  TEXT NOT NULL
+                   CHECK (change_source IN
+                          ('baseline', 'import_create', 'import_update',
+                           'withdraw', 're_enable')),
+    stem           TEXT NOT NULL,
+    options        TEXT NOT NULL, -- JSON: [{"key": "A", "text": "..."}]
+    answer         TEXT NOT NULL,
+    difficulty     REAL NOT NULL,
+    discrimination REAL NOT NULL,
+    content_tag    TEXT,
+    is_active      INTEGER NOT NULL CHECK (is_active IN (0, 1)),
+    created_at     TEXT NOT NULL,  -- UTC ISO-8601, recorded inside the change transaction
+    PRIMARY KEY (item_id, version)
+) WITHOUT ROWID;
 """
 
 
@@ -224,4 +251,10 @@ def init_db() -> None:
                 """,
                 seed_items(),
             )
+        # Revision history: give every item a version-1 baseline snapshot.
+        # This covers both a legacy bank's pre-existing items (their first
+        # startup with this module) and the freshly seeded demo bank.  The
+        # guard is idempotent: items already having any revision are skipped,
+        # so repeated startups never regenerate baselines.
+        ensure_baseline_revisions(conn)
         conn.commit()

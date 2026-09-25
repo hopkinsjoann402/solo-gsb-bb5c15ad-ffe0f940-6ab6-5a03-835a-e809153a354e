@@ -60,6 +60,68 @@ class ItemDetailOut(BankItemOut):
     options: list[OptionOut]
 
 
+# ---- item revision history -------------------------------------------------
+
+RevisionChangeSource = Literal[
+    "baseline", "import_create", "import_update", "withdraw", "re_enable"
+]
+
+
+class ItemRevisionSummaryOut(BaseModel):
+    """One entry in an item's version list (metadata only, no snapshot body)."""
+
+    item_id: str = Field(..., description="题目 ID")
+    version: int = Field(
+        ..., ge=1, description="版本号，每题内从 1 开始连续递增、永不复用"
+    )
+    change_source: RevisionChangeSource = Field(
+        ...,
+        description=(
+            "变更来源：baseline=旧库首启基线（含初始演示题库）；"
+            "import_create=正式批量导入新增；import_update=正式导入且内容实际变化；"
+            "withdraw=启用状态实际变为撤回；re_enable=撤回后实际重新启用"
+        ),
+    )
+    is_active: bool = Field(
+        ...,
+        description="该版本变更后的启用状态：false 为撤回（快照内同样保存该值）",
+    )
+    created_at: str = Field(
+        ..., description="版本写入时刻（UTC，ISO-8601）；与原写事务同一事务内记录"
+    )
+
+
+class ItemRevisionListOut(BaseModel):
+    item_id: str
+    count: int = Field(..., description="该题历史版本总数")
+    results: list[ItemRevisionSummaryOut] = Field(
+        default_factory=list,
+        description="版本列表，按 version 升序；未知题目返回 404",
+    )
+
+
+class ItemRevisionOut(BaseModel):
+    """A specific version's complete immutable snapshot."""
+
+    item_id: str
+    version: int = Field(..., ge=1)
+    change_source: RevisionChangeSource
+    stem: str = Field(..., description="该版本的题干（变更后完整快照）")
+    options: list[OptionOut] = Field(
+        ..., description="该版本的全部选项（变更后完整快照）"
+    )
+    answer: str = Field(..., description="该版本的正确答案选项键")
+    difficulty: float = Field(..., description="该版本的难度 b")
+    discrimination: float = Field(..., description="该版本的区分度 a")
+    content_tag: str | None = Field(
+        None, description="该版本的内容标签；无标签时为 null"
+    )
+    is_active: bool = Field(
+        ..., description="该版本的启用状态：false 表示该版本记录的是撤回状态"
+    )
+    created_at: str = Field(..., description="版本写入时刻（UTC，ISO-8601）")
+
+
 class ItemBankOut(BaseModel):
     count: int
     items: list[BankItemOut]
