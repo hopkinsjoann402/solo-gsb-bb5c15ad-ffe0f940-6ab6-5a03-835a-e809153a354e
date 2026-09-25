@@ -209,6 +209,52 @@ class ItemImportResponse(BaseModel):
     )
 
 
+# ---- item revision history -------------------------------------------------
+
+VersionSource = Literal["baseline", "import", "availability"]
+
+
+class ItemVersionOut(BaseModel):
+    """One revision-history entry of a bank item (list view)."""
+
+    version: int = Field(..., description="版本号：每题从 1 开始连续递增、只增不改")
+    source: VersionSource = Field(
+        ...,
+        description=(
+            "变更来源：baseline=旧库启动时为现存题建立的基线；"
+            "import=批量导入新增或内容变化；availability=启用/撤回状态实际变化"
+        ),
+    )
+    is_active: bool = Field(..., description="该版本快照中的启用状态")
+    created_at: str = Field(..., description="该版本写入的 UTC 时间（秒级）")
+
+
+class ItemVersionListOut(BaseModel):
+    item_id: str = Field(..., description="被查询的题目 ID")
+    count: int = Field(..., description="该题已记录的版本总数")
+    versions: list[ItemVersionOut] = Field(
+        default_factory=list, description="按版本号升序排列的版本条目"
+    )
+
+
+class ItemVersionSnapshotOut(BaseModel):
+    """Full snapshot of one recorded item version (excludes exposure_count)."""
+
+    item_id: str
+    version: int = Field(..., description="版本号：每题从 1 开始连续递增")
+    source: VersionSource = Field(
+        ..., description="变更来源：baseline / import / availability"
+    )
+    difficulty: float
+    discrimination: float
+    content_tag: str | None = None
+    stem: str
+    options: list[OptionOut]
+    answer: str
+    is_active: bool = Field(..., description="该版本快照中的启用状态")
+    created_at: str = Field(..., description="该版本写入的 UTC 时间（秒级）")
+
+
 # ---- sessions -------------------------------------------------------------
 
 class SessionCreate(BaseModel):

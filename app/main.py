@@ -42,6 +42,20 @@ predicted correct rates, and a standardised deviation
 samples or when its denominator is zero), flagging systematic miscalibration
 at ``|z| >= 1.96``.
 
+Every content or availability change to a bank item is also recorded in the
+append-only revision history (``item_versions``): a real import that creates
+an item or alters its content, and an availability toggle that actually
+flips the state, each append one consecutive version — inside the same
+serialised write transaction — with the change source and a full
+post-change snapshot (stem, options, answer, difficulty, discrimination,
+content tag, enabled flag; the answer-driven ``exposure_count`` is not part
+of it).  Same-value retries, dry runs and validation-rejected batches record
+nothing, later imports never rewrite recorded versions, and a legacy bank
+receives one baseline version per item on first startup (never duplicated
+on restarts).  ``GET /api/items/{id}/versions`` lists an item's versions and
+``GET /api/items/{id}/versions/{version}`` returns one snapshot; unknown
+items or versions get a 404.
+
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
 cannot be lost to read/write races.
@@ -81,6 +95,9 @@ from .models import (
     ItemImportResponse,
     ItemImportRowOut,
     ItemOut,
+    ItemVersionListOut,
+    ItemVersionOut,
+    ItemVersionSnapshotOut,
     NextItemOut,
     ProgressOut,
     ResponseCreate,
@@ -92,6 +109,12 @@ from .models import (
     SimilarityMatchOut,
 )
 from .similarity import find_similar_sessions
+from .versions import (
+    SOURCE_AVAILABILITY,
+    import_content_changed,
+    record_version_for_import,
+    record_version_for_row,
+)
 
 DEFAULT_EXPOSURE_LIMIT = int(os.getenv("DEFAULT_EXPOSURE_LIMIT", "5"))
 
@@ -103,9 +126,10 @@ app = FastAPI(
         "活动会话支持暂停（冻结剩余时限）与恢复（按剩余秒数重算 UTC 截止时间）；"
         "题目可撤回/启用，撤回题不再参与新取题；"
         "已结束会话支持答卷雷同复核（同错选项加权相似度）；"
-        "单题预测概率校准对比作答前保存的 p_correct 与实际得分。"
+        "单题预测概率校准对比作答前保存的 p_correct 与实际得分；"
+        "题库修订历史按题记录连续版本（导入/启停变更的完整快照，只增不改）。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -498,6 +522,10 @@ def set_item_availability(
     still served from the idempotency store.  ``{"is_active": true}``
     re-enables the item.  The toggle itself is idempotent: setting the
     same state again simply returns the current row.
+
+    Revision history: a toggle that actually flips the state appends one
+    ``availability`` version (full post-change snapshot) inside the same
+    transaction; a same-state retry records nothing.
     """
     with transaction(conn):
         row = conn.execute(
@@ -505,6 +533,7 @@ def set_item_availability(
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="item not found")
+        state_changed = bool(row["is_active"]) != body.is_active
         conn.execute(
             "UPDATE items SET is_active = ? WHERE id = ?",
             (1 if body.is_active else 0, item_id),
@@ -512,7 +541,101 @@ def set_item_availability(
         row = conn.execute(
             "SELECT * FROM items WHERE id = ?", (item_id,)
         ).fetchone()
+        if state_changed:
+            record_version_for_row(
+                conn, row, source=SOURCE_AVAILABILITY, created_at=utc_now()
+            )
     return serialize_bank_item(row)
+
+
+# -------------------------------------------------------------------------
+# Item revision history (read-only inspection)
+# -------------------------------------------------------------------------
+
+@app.get(
+    "/api/items/{item_id}/versions",
+    response_model=ItemVersionListOut,
+    tags=["items"],
+    summary="题目修订历史（版本列表，按版本号升序）",
+)
+def list_item_versions(
+    item_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> ItemVersionListOut:
+    """List the recorded versions of one item, oldest first.
+
+    Strictly read-only.  Every entry carries the version number, the change
+    source (``baseline`` / ``import`` / ``availability``), the enabled flag
+    of that snapshot and its UTC recording time; the full content lives in
+    the per-version snapshot endpoint.  An unknown item gets a 404.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    rows = conn.execute(
+        "SELECT version, source, is_active, created_at FROM item_versions "
+        "WHERE item_id = ? ORDER BY version",
+        (item_id,),
+    ).fetchall()
+    return ItemVersionListOut(
+        item_id=item_id,
+        count=len(rows),
+        versions=[
+            ItemVersionOut(
+                version=r["version"],
+                source=r["source"],
+                is_active=bool(r["is_active"]),
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ],
+    )
+
+
+@app.get(
+    "/api/items/{item_id}/versions/{version}",
+    response_model=ItemVersionSnapshotOut,
+    tags=["items"],
+    summary="题目指定版本的完整快照",
+)
+def get_item_version(
+    item_id: str,
+    version: int,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ItemVersionSnapshotOut:
+    """Return the full snapshot of one recorded item version.
+
+    Strictly read-only; history is append-only, so a recorded snapshot
+    never changes afterwards.  The snapshot covers stem, options, answer,
+    difficulty, discrimination, content tag and the enabled flag — the
+    answer-driven ``exposure_count`` is not part of it.  An unknown item or
+    an unknown version number gets a 404.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    row = conn.execute(
+        "SELECT * FROM item_versions WHERE item_id = ? AND version = ?",
+        (item_id, version),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="item version not found")
+    return ItemVersionSnapshotOut(
+        item_id=row["item_id"],
+        version=row["version"],
+        source=row["source"],
+        difficulty=row["difficulty"],
+        discrimination=row["discrimination"],
+        content_tag=row["content_tag"],
+        stem=row["stem"],
+        options=parse_options(row["options"]),
+        answer=row["answer"],
+        is_active=bool(row["is_active"]),
+        created_at=row["created_at"],
+    )
 
 
 @app.get(
@@ -613,20 +736,25 @@ ON CONFLICT(id) DO UPDATE SET
 """
 
 
-def _existing_item_ids(
+def _existing_item_rows(
     conn: sqlite3.Connection, item_ids: list[str]
-) -> set[str]:
-    found: set[str] = set()
+) -> dict[str, sqlite3.Row]:
+    """Full current bank rows of the given ids, keyed by id."""
+    found: dict[str, sqlite3.Row] = {}
     for start in range(0, len(item_ids), _EXISTING_ID_CHUNK):
         chunk = item_ids[start : start + _EXISTING_ID_CHUNK]
         placeholders = ",".join("?" for _ in chunk)
-        found.update(
-            r["id"]
-            for r in conn.execute(
-                f"SELECT id FROM items WHERE id IN ({placeholders})", chunk
-            ).fetchall()
-        )
+        for row in conn.execute(
+            f"SELECT * FROM items WHERE id IN ({placeholders})", chunk
+        ).fetchall():
+            found[row["id"]] = row
     return found
+
+
+def _existing_item_ids(
+    conn: sqlite3.Connection, item_ids: list[str]
+) -> set[str]:
+    return set(_existing_item_rows(conn, item_ids))
 
 
 def _import_payload(
@@ -725,6 +853,13 @@ def import_items(
     (``valid=false``, counts zero); a database-level failure rolls the
     whole batch back.
 
+    Revision history, recorded in the same transaction: every brand-new id
+    and every update whose snapshot-covered content actually changed
+    appends one ``import`` version with the post-change snapshot (the
+    preserved ``is_active`` included).  A same-value re-import, a dry run
+    and a validation-rejected batch append nothing, and recorded versions
+    are never rewritten by later imports.
+
     ``results`` and ``errors`` are both ordered by the stable row number, so
     callers can splice them back into their original spreadsheet lines.
     """
@@ -754,7 +889,8 @@ def import_items(
     with transaction(conn):
         # Re-classify inside the write lock: the serialised transaction makes
         # the exists-check plus upsert atomic against concurrent imports.
-        existing_ids = _existing_item_ids(conn, [i.id for i in items])
+        existing_rows = _existing_item_rows(conn, [i.id for i in items])
+        existing_ids = set(existing_rows)
         conn.executemany(
             _UPSERT_ITEM_SQL,
             [
@@ -770,6 +906,25 @@ def import_items(
                 for item in items
             ],
         )
+        # Revision history, still inside the same transaction: a brand-new
+        # id gets its version 1 (enabled by default); an existing id gets
+        # the next version only when the snapshot-covered content actually
+        # changed (a same-value re-import records nothing).  The snapshot
+        # carries the preserved is_active flag, never the exposure count.
+        versioned_at = utc_now()
+        for item in items:
+            prior = existing_rows.get(item.id)
+            if prior is None:
+                record_version_for_import(
+                    conn, item, is_active=1, created_at=versioned_at
+                )
+            elif import_content_changed(prior, item):
+                record_version_for_import(
+                    conn,
+                    item,
+                    is_active=prior["is_active"],
+                    created_at=versioned_at,
+                )
     payload, _ = _import_payload(
         dry_run=False,
         total=total,

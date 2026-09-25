@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from .seed import seed_items
+from .versions import SCHEMA_ITEM_VERSIONS, ensure_baseline_versions
 
 # Default keeps local runs working out of the box; the Docker image sets this
 # to /data/quiz.db (a named volume) so data survives container restarts.
@@ -84,7 +85,7 @@ CREATE TABLE IF NOT EXISTS responses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_responses_session ON responses(session_id);
-"""
+""" + SCHEMA_ITEM_VERSIONS
 
 
 def get_db() -> Iterator[sqlite3.Connection]:
@@ -224,4 +225,10 @@ def init_db() -> None:
                 """,
                 seed_items(),
             )
+        # Revision-history baseline: every item that has no version row yet
+        # (a pre-existing bank on a legacy database, or the freshly seeded
+        # demo bank) gets exactly one version-1 'baseline' snapshot.  The
+        # INSERT ... WHERE NOT EXISTS is idempotent, so repeated startups
+        # never duplicate baselines.
+        ensure_baseline_versions(conn)
         conn.commit()

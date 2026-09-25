@@ -16,6 +16,7 @@
 - 提供**单题质量复盘** `GET /api/items/{id}/analysis`：只统计**已结束会话**的历史作答，并使用作答时冻结保存的 `score`（之后修改题目答案不影响复盘结果）；对每个答过目标题且同场至少另答一题的会话，以「目标题得分 + 同场其余题答对比例」组成样本，返回有效样本数、历史正确率及两者的 Pearson 相关系数（样本少于 5 或任一序列无方差时为 `null`；未知题目 `404`；接口只读）；
 - 提供**答卷雷同复核** `GET /api/sessions/{id}/similarity`：面向**已结束会话**，按 `item_id` 对齐双方历史作答，仅「双方选择同一错误选项」计为同错匹配（正确作答不计），每个匹配按该错误选项在全体已结束会话中的稀有程度加权（`log((该题错误作答总数+2)/(选择该错误选项的次数+1))`），分数为权重之和除以共答题数；候选至少共答 `min_shared` 题（默认 4），按分数、同错数降序及会话 ID 升序返回前 `limit` 条；统计只读 `responses` 中冻结的 `score` 与 `response`，题库改答案后结果不变；
 - 提供**单题预测概率校准** `GET /api/items/{id}/calibration`：只统计**已结束会话**中该题的历史作答，使用作答时保存的作答前 `p_correct` 与冻结 `score`（**不**按当前能力值或改动后的题目参数重算），返回样本数、实际正确率、平均预测正确率与标准化偏差 `z=(Σscore−Σp_correct)/√Σ[p_correct(1−p_correct)]`；样本少于 30 或分母为零时 `z` 与偏离标记为 `null`，其余按 `|z|≥1.96` 给出偏离标记（未知题目 `404`，无历史样本时比率为 `null`，接口只读）；
+- 内置**题库修订历史**：正式导入新增或内容变化、启用状态实际变化时，在原写事务内为该题追加一个连续版本（记录变更来源与变更后完整快照：题干、选项、答案、难度、区分度、内容标签与启用状态，**不含**随作答变化的曝光次数）；同值重试、预检与整批校验失败均不产生版本；历史版本只增不改，后续导入不会改写；旧库首次启动自动为现存题建立基线版本（重复启动不重复生成）；提供 `GET /api/items/{id}/versions` 版本列表与 `GET /api/items/{id}/versions/{version}` 快照查询（未知题目或版本 `404`，接口只读）；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -23,12 +24,13 @@
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 雷同复核 / 概率校准
+│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 修订历史 / 雷同复核 / 概率校准
 │   ├── irt.py         # 2PL 概率、Fisher 信息量、单次 Newton 更新
 │   ├── analysis.py    # 单题质量复盘：历史样本构建与 Pearson 相关系数
 │   ├── calibration.py # 单题预测概率校准：p_correct 与实际得分的标准化偏差
 │   ├── similarity.py  # 答卷雷同复核：同错选项加权相似度（已结束会话）
 │   ├── importer.py    # 题库批量导入的逐行校验（ID/选项/答案/难度区分度/标签/重复 ID）
+│   ├── versions.py    # 题库修订历史：版本快照记录、内容变化检测、启动基线回填
 │   ├── database.py    # SQLite 连接、建表、初始化
 │   ├── models.py      # Pydantic 请求/响应模型
 │   └── seed.py        # 确定性演示题库（ITEM-001 ~ ITEM-030）
@@ -310,6 +312,56 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
   有错误的正式提交返回 HTTP `422` 且 `valid=false`、计数为 0；
   预检即使有错误也是 HTTP `200`，便于把预检集成进上传 UI。
 
+### 题库修订历史（`GET /api/items/{id}/versions`）
+
+每道题维护一条**连续、只增不改**的版本链，记录题库内容何时、因何变化：
+
+- **何时记录**（均在产生变更的**同一个 `BEGIN IMMEDIATE` 写事务**内追加版本，变更与快照同生共灭）：
+  - `POST /api/items/import` 正式提交（`dry_run=false`）：**新增**题目记录版本 1；
+    **更新**既有题时，仅当快照覆盖的内容字段（题干/选项/答案/难度/区分度/内容标签）
+    实际发生变化才记录新版本；
+  - `PATCH /api/items/{id}/availability`：仅当启用状态**实际翻转**（启用↔撤回）时记录新版本。
+- **何时不记录**：同值重试（导入内容完全相同、重复设置同一启用状态）、
+  预检 `dry_run=true`、整批校验失败（HTTP 422）以及作答引起的曝光计数变化，都不产生版本。
+- **快照内容**：`difficulty`、`discrimination`、`content_tag`、`stem`、`options`、`answer`
+  与 `is_active`（更新导入保留的启用状态会如实进入快照）；**不包含 `exposure_count`**——
+  曝光次数随作答流量变化，不属于题库编辑历史。
+- **变更来源 `source`**：`baseline`（服务启动时为无版本现存题建立的基线）、
+  `import`（批量导入新增或内容变化）、`availability`（启用/撤回状态变化）。
+- **版本号**：每题从 1 开始连续递增、无空洞（写事务串行化保证并发导入也不会跳号）；
+  历史版本**只追加不改写**，后续导入/启停永远不会改动已记录的快照。
+- **基线迁移**：旧版本数据库首次启动时，`item_versions` 表自动创建，并为每道
+  还没有版本的现存题补一条版本 1 的 `baseline` 快照（新库的 30 道演示题同样处理）；
+  该回填按「无任何版本才补」执行，**重复启动不会重复生成**。
+- **查询接口**（均只读）：
+  - `GET /api/items/{id}/versions`：版本列表，按版本号升序，每条含
+    `version` / `source` / `is_active` / `created_at`（UTC 秒级）；
+  - `GET /api/items/{id}/versions/{version}`：指定版本的完整快照；
+  - 未知题目或未知版本号均返回 **HTTP 404**。
+
+```jsonc
+// GET /api/items/ITEM-001/versions
+{
+  "item_id": "ITEM-001",
+  "count": 3,
+  "versions": [
+    {"version": 1, "source": "baseline",     "is_active": true,  "created_at": "2026-09-25T08:00:00+00:00"},
+    {"version": 2, "source": "import",       "is_active": true,  "created_at": "2026-09-25T09:12:31+00:00"},
+    {"version": 3, "source": "availability", "is_active": false, "created_at": "2026-09-25T09:40:05+00:00"}
+  ]
+}
+
+// GET /api/items/ITEM-001/versions/2
+{
+  "item_id": "ITEM-001", "version": 2, "source": "import",
+  "difficulty": -2.9, "discrimination": 0.9, "content_tag": "算术",
+  "stem": "计算：12 + 7 = ?",
+  "options": [{"key": "A", "text": "19"}, {"key": "B", "text": "18"}, ...],
+  "answer": "A", "is_active": true,
+  "created_at": "2026-09-25T09:12:31+00:00"
+}
+```
+
 ### 单题质量复盘（`GET /api/items/{id}/analysis`）
 
 只读地复盘单道题在历史测验中的表现，用于发现偏易/偏难或区分度异常的题目：
@@ -439,6 +491,8 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | GET  | `/api/items/{item_id}/analysis` | **单题质量复盘**（已结束会话样本、历史正确率、与同场表现的 Pearson 相关系数；只读） |
 | GET  | `/api/items/{item_id}/calibration` | **单题预测概率校准**（已结束会话样本、实际/平均预测正确率、标准化偏差 z 与偏离标记；只读） |
 | POST | `/api/items/import` | **题库批量导入/预检**（逐行错误、dry_run、事务原子 upsert、更新保留曝光数与启用状态） |
+| GET  | `/api/items/{item_id}/versions` | **题目修订历史**（版本号、变更来源、启用状态、记录时间；未知题目 404；只读） |
+| GET  | `/api/items/{item_id}/versions/{version}` | **指定版本完整快照**（题干/选项/答案/难度/区分度/标签/启用状态；未知题目或版本 404；只读） |
 | POST | `/api/sessions` | 创建测验会话 |
 | GET  | `/api/sessions/{id}` | 会话状态 |
 | GET  | `/api/sessions/{id}/progress` | **会话进度**（θ、已答数、挂起题、已答题目、暂停状态与剩余秒数） |
@@ -518,6 +572,20 @@ curl -s -X PATCH http://localhost:8000/api/items/ITEM-001/availability \
 # 若某会话的挂起题被撤回：再次 /next 会在同一事务内清除挂起项并重选
 # （已计曝光不回退，响应 note 有说明）；对撤回题提交新作答 -> HTTP 409，
 # 已保存的 response_id 重放仍返回首次结果（HTTP 200）
+
+# 1d) 题库修订历史：正式导入新增/内容变化、启用状态实际翻转都会在同事务内
+#     追加一个连续版本；同值重试、预检、整批校验失败与作答曝光均不产生版本
+curl -s http://localhost:8000/api/items/ITEM-001/versions
+# {"item_id":"ITEM-001","count":3,"versions":[
+#   {"version":1,"source":"baseline","is_active":true,"created_at":"..."},
+#   {"version":2,"source":"import","is_active":true,"created_at":"..."},
+#   {"version":3,"source":"availability","is_active":false,"created_at":"..."}]}
+curl -s http://localhost:8000/api/items/ITEM-001/versions/2
+# {"item_id":"ITEM-001","version":2,"source":"import","difficulty":-2.9,
+#  "discrimination":0.9,"content_tag":"算术","stem":"...",
+#  "options":[{"key":"A","text":"..."},...],"answer":"A",
+#  "is_active":true,"created_at":"..."}   # 快照不含 exposure_count
+# 未知题目或未知版本号 -> HTTP 404；历史版本只增不改，重复启动不重复生成基线
 
 # 2) 创建会话（初始 θ=0，最多 10 题，单题曝光上限 5）
 curl -s -X POST http://localhost:8000/api/sessions \
@@ -645,6 +713,7 @@ curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=4&limit=2
 - 曝光计数是**跨会话全局**的：用于模拟真实 CAT 的曝光控制（曝光上限可按会话放宽/收紧）。
 - 暂停/恢复**无需额外配置**：状态与冻结秒数随会话存放在同一 SQLite 库；服务启动时旧库自动迁移（新增 `paused_at` / `remaining_seconds` 列，并把 `status` 的 CHECK 放宽到 `active/paused/finished`），历史会话与答题记录原样保留。所有时间戳均为 **UTC**、秒级精度，因此暂停冻结与恢复重算的截止时间最多有 ±1 秒的取整误差。
 - 题目撤回**无需额外配置**：旧库启动时自动为 `items` 表新增 `is_active` 列（`DEFAULT 1`），**既有题目全部迁移为启用**；撤回只影响新取题与新的作答，历史答题记录、曝光计数与单题复盘统计均不受影响。
+- 题库修订历史**无需额外配置**：旧库启动时自动创建 `item_versions` 表，并为每道还没有版本的现存题补一条版本 1 的 `baseline` 快照（重复启动不重复生成）；版本只追加不改写，快照不含随作答变化的 `exposure_count`；两个查询接口均只读，可安全随时调用。
 - 答卷雷同复核**无需额外配置**：不新增任何表，直接复用现有 `sessions`/`responses`；只统计 `finished` 会话，且只读作答时冻结的 `score` 与 `response`——题库改答案、题目撤回都不影响复核结果；接口完全只读，可安全地对历史会话随时调用。
 - 单题预测概率校准**无需额外配置**：同样只读 `responses` 中作答前保存的 `p_correct` 与冻结的 `score`，不按当前能力值或改动后的题目参数重算；只统计 `finished` 会话，接口完全只读。
 - SQLite + WAL 适合单机/演示与中小流量；写事务已串行化（暂停/恢复同样使用 `BEGIN IMMEDIATE`），水平扩展时可替换连接层。
